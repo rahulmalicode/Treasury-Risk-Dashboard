@@ -1,0 +1,162 @@
+-- queries.sql
+-- Risk queries used to feed the Excel workbook (Treasury_Risk_Dashboard.xlsx).
+-- Reporting date used throughout: 2026-03-31
+-- Run against the balance_sheet table created in schema.sql.
+
+-- 
+-- 1. MATURITY BUCKETING (feeds the interest rate gap sheet)
+-- Buckets: 0-30d, 31-90d, 91-365d, 1-3y, 3y+
+-- 
+SELECT
+    instrument_id,
+    instrument_type,
+    CASE
+        WHEN instrument_type IN ('Loan', 'Security') THEN 'Asset'
+        ELSE 'Liability'
+    END AS side,
+    amount,
+    currency,
+    interest_rate_pct,
+    rate_type,
+    maturity_date,
+    CAST(julianday(maturity_date) - julianday('2026-03-31') AS INTEGER) AS days_to_maturity,
+    CASE
+        WHEN julianday(maturity_date) - julianday('2026-03-31') <= 30 THEN '1. 0-30 Days'
+        WHEN julianday(maturity_date) - julianday('2026-03-31') <= 90 THEN '2. 31-90 Days'
+        WHEN julianday(maturity_date) - julianday('2026-03-31') <= 365 THEN '3. 91-365 Days'
+        WHEN julianday(maturity_date) - julianday('2026-03-31') <= 1095 THEN '4. 1-3 Years'
+        ELSE '5. 3+ Years'
+    END AS maturity_bucket
+FROM balance_sheet
+ORDER BY days_to_maturity;
+
+
+--
+-- 2. GAP SUMMARY BY BUCKET (Assets vs Liabilities, and net gap)
+--
+SELECT
+    maturity_bucket,
+    SUM(CASE WHEN side = 'Asset' THEN amount ELSE 0 END) AS total_assets,
+    SUM(CASE WHEN side = 'Liability' THEN amount ELSE 0 END) AS total_liabilities,
+    SUM(CASE WHEN side = 'Asset' THEN amount ELSE 0 END)
+        - SUM(CASE WHEN side = 'Liability' THEN amount ELSE 0 END) AS net_gap
+FROM (
+    SELECT
+        amount,
+        CASE WHEN instrument_type IN ('Loan', 'Security') THEN 'Asset' ELSE 'Liability' END AS side,
+        CASE
+            WHEN julianday(maturity_date) - julianday('2026-03-31') <= 30 THEN '1. 0-30 Days'
+            WHEN julianday(maturity_date) - julianday('2026-03-31') <= 90 THEN '2. 31-90 Days'
+            WHEN julianday(maturity_date) - julianday('2026-03-31') <= 365 THEN '3. 91-365 Days'
+            WHEN julianday(maturity_date) - julianday('2026-03-31') <= 1095 THEN '4. 1-3 Years'
+            ELSE '5. 3+ Years'
+        END AS maturity_bucket
+    FROM balance_sheet
+)
+GROUP BY maturity_bucket
+ORDER BY maturity_bucket;
+
+
+--
+-- 3. HQLA TOTAL (numerator of the simplified LCR proxy)
+-- Only securities flagged hqla_eligible = 'Y' count as High Quality
+-- Liquid Assets under the simplified model used in this workbook.
+-- 
+SELECT
+    SUM(amount) AS total_hqla
+FROM balance_sheet
+WHERE instrument_type = 'Security'
+  AND hqla_eligible = 'Y';
+
+
+-- 
+-- 4. ESTIMATED NET CASH OUTFLOWS, NEXT 30 DAYS (LCR denominator proxy)
+-- Simplified run-off assumptions (not regulatory Basel weights):
+--   Retail deposits      -> 8%  run-off
+--   Wholesale deposits    -> 25% run-off
+--   Loans maturing <=30d -> counted as an inflow, capped at 75% of
+--                           outflows per the standard LCR inflow cap
+-- 
+WITH deposit_outflows AS (
+    SELECT
+        SUM(CASE WHEN instrument_type = 'Deposit_Retail' THEN amount * 0.08 ELSE 0 END) AS retail_outflow,
+        SUM(CASE WHEN instrument_type = 'Deposit_Wholesale' THEN amount * 0.25 ELSE 0 END) AS wholesale_outflow
+    FROM balance_sheet
+),
+loan_inflows AS (
+    SELECT COALESCE(SUM(amount), 0) AS inflow_30d
+    FROM balance_sheet
+    WHERE instrument_type = 'Loan'
+      AND julianday(maturity_date) - julianday('2026-03-31') <= 30
+)
+SELECT
+    retail_outflow,
+    wholesale_outflow,
+    (retail_outflow + wholesale_outflow) AS gross_outflow,
+    inflow_30d,
+    MIN(inflow_30d, 0.75 * (retail_outflow + wholesale_outflow)) AS capped_inflow,
+    (retail_outflow + wholesale_outflow) - MIN(inflow_30d, 0.75 * (retail_outflow + wholesale_outflow)) AS net_outflow
+FROM deposit_outflows, loan_inflows;
+
+
+-- 
+-- 5. CREDIT CONCENTRATION BY COUNTERPARTY (Top 10 exposures)
+-- Loans and securities only - deposits are liabilities, not exposures.
+-- 
+SELECT
+    counterparty,
+    counterparty_rating,
+    COUNT(*) AS num_instruments,
+    SUM(amount) AS total_exposure,
+    ROUND(100.0 * SUM(amount) / (SELECT SUM(amount) FROM balance_sheet WHERE instrument_type IN ('Loan','Security')), 2) AS pct_of_total_credit_book
+FROM balance_sheet
+WHERE instrument_type IN ('Loan', 'Security')
+GROUP BY counterparty, counterparty_rating
+ORDER BY total_exposure DESC
+LIMIT 10;
+
+
+-- 
+-- 6. CREDIT EXPOSURE BY RATING BAND
+-- 
+SELECT
+    counterparty_rating,
+    COUNT(*) AS num_instruments,
+    SUM(amount) AS total_exposure,
+    ROUND(100.0 * SUM(amount) / (SELECT SUM(amount) FROM balance_sheet WHERE instrument_type IN ('Loan','Security')), 2) AS pct_of_credit_book
+FROM balance_sheet
+WHERE instrument_type IN ('Loan', 'Security')
+GROUP BY counterparty_rating
+ORDER BY
+    CASE counterparty_rating
+        WHEN 'AAA' THEN 1 WHEN 'AA' THEN 2 WHEN 'A' THEN 3
+        WHEN 'BBB' THEN 4 WHEN 'BB' THEN 5 WHEN 'B' THEN 6
+        ELSE 7
+    END;
+
+
+-- 
+-- 7. RATE-SENSITIVE BOOK (for +/-100bps NII sensitivity)
+-- Floating-rate assets and liabilities reprice with market rates;
+-- fixed-rate instruments do not move within the 1-year horizon.
+-- 
+SELECT
+    CASE WHEN instrument_type IN ('Loan','Security') THEN 'Asset' ELSE 'Liability' END AS side,
+    rate_type,
+    SUM(amount) AS total_amount
+FROM balance_sheet
+WHERE julianday(maturity_date) - julianday('2026-03-31') <= 365
+GROUP BY side, rate_type
+ORDER BY side, rate_type;
+
+
+-- 
+-- 8. CURRENCY EXPOSURE SUMMARY
+-- 
+SELECT
+    currency,
+    SUM(CASE WHEN instrument_type IN ('Loan','Security') THEN amount ELSE 0 END) AS total_assets,
+    SUM(CASE WHEN instrument_type LIKE 'Deposit%' THEN amount ELSE 0 END) AS total_liabilities
+FROM balance_sheet
+GROUP BY currency
+ORDER BY total_assets DESC;
